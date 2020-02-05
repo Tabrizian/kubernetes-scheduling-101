@@ -16,16 +16,10 @@ package main
 
 import (
 	"flag"
-	"fmt"
-	"os"
-	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	coreV1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
-
-	k8sConfig "github.com/Tabrizian/kubernetes-scheduling-101/k8s/config"
+	k8sConfig "github.com/Tabrizian/kubernetes-scheduling-101/k8s"
+	"github.com/Tabrizian/kubernetes-scheduling-101/scheduler"
+	log "github.com/sirupsen/logrus"
 	//
 	// Uncomment to load all auth plugins
 	// _ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -42,36 +36,13 @@ func main() {
 
 	kubeconfig = flag.String("kubeconfig", "", "(optional) absolute path to the kubeconfig file")
 	flag.Parse()
-	kubeconfig = k8sConfig.GetKubeConfig(kubeconfig)
-
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	log.Info("Kubeconfig flag is loaded")
+	clientset, err := k8sConfig.GetKubeConfig(kubeconfig)
 	if err != nil {
+		log.Error("Failed to create clientset")
 		panic(err.Error())
 	}
-
-	// create the clientset
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	podWatcher, err := clientset.CoreV1().Pods("").Watch(metav1.ListOptions{})
-
-	if err != nil {
-		panic(err.Error())
-	}
-	ch := podWatcher.ResultChan()
-	for event := range ch {
-		pod, ok := event.Object.(*coreV1.Pod)
-		if !ok {
-			panic(err.Error())
-		}
-		fmt.Printf("Pod is %v \n", pod.Name)
-		fmt.Println()
-	}
-
-	time.Sleep(10 * time.Second)
+	imanScheduler := scheduler.NewScheduler("iman-scheduler", clientset)
+	log.Info("Registering new scheduler")
+	imanScheduler.Register()
 }
-
