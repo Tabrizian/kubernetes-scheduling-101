@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	coreV1 "k8s.io/api/core/v1"
@@ -11,24 +12,38 @@ import (
 	"time"
 )
 
+// Scheduler struct containing main attributes of scheduling
 type Scheduler struct {
 	Name    string                // Scheduler Name
 	client  *kubernetes.Clientset // k8s Client
 	watcher watch.Interface       // Watcher
-
+	queue	[]*coreV1.Pod
+	nodes	*coreV1.NodeList
 }
 
+// NewScheduler creates a new scheduler 
 func NewScheduler(name string, client *kubernetes.Clientset) *Scheduler {
 	scheduler := &Scheduler{
 		Name:   name,
 		client: client,
 	}
 
+	go scheduler.Schedule()
 	return scheduler
 }
 
+// Schedule is the background coroutine
+func (s *Scheduler) Schedule() {
+	for {
+		log.Info("Queue Length is ", len(s.queue))
+		s.Random()
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// Register is the function
 func (s *Scheduler) Register() error {
-	watcher, err := s.client.CoreV1().Pods("").Watch(metav1.ListOptions{
+	watcher, err := s.client.CoreV1().Pods("").Watch(context.TODO(), metav1.ListOptions{
 		FieldSelector: "spec.schedulerName=" + s.Name + ",status.phase=Pending",
 	})
 	log.Info("Watching for uncscheduled pods")
@@ -36,11 +51,12 @@ func (s *Scheduler) Register() error {
 		return errors.Wrap(err, "Failed to create a watch on Pods")
 	}
 	s.watcher = watcher
-	log.Info("Watching for new Pods to be scheduled for", s.Name)
-	nodes, err := s.client.CoreV1().Nodes().List(metav1.ListOptions{})
+	log.Info("Watching for new Pods to be scheduled for ", s.Name)
+	nodes, err := s.client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return errors.Wrap(err, "Failed to list the nodes")
 	}
+	s.nodes = nodes
 	ch := s.watcher.ResultChan()
 	for event := range ch {
 		if event.Type != "ADDED" {
@@ -50,19 +66,34 @@ func (s *Scheduler) Register() error {
 		if !ok {
 			panic(err.Error())
 		}
-		log.Info("Pod is ", pod.Name)
-		s.Random(pod, nodes)
+		log.Info("Pod added to the queue ", pod.Name)
+		s.queue = append(s.queue, pod)
 	}
 
 	return err
 }
 
-func (s *Scheduler) Random(pod *coreV1.Pod, nodes *coreV1.NodeList) (string, error) {
-	nodeItems := nodes.Items
+// Random randomly schedules the first item on the queue
+// on the nodes
+func (s *Scheduler) Random() error {
+	if s.nodes == nil || len(s.nodes.Items) == 0 {
+		log.Info("There is no node to schedule on!")
+		return nil
+	}
+
+	if len(s.queue) == 0 {
+		log.Info("There is no Pod to be scheduled.")
+		return nil
+	}
+
+	nodeItems := s.nodes.Items
+
+	pod := s.queue[0]
+	s.queue = s.queue[1:]
 	randomNumber := rand.Intn(len(nodeItems))
 	randomNode := nodeItems[randomNumber]
-	_, err := s.client.CoreV1().Pods(pod.Namespace).Update(pod)
-	s.client.CoreV1().Pods(pod.Namespace).Bind(&coreV1.Binding{
+	_, err := s.client.CoreV1().Pods(pod.Namespace).Update(context.TODO(), pod, metav1.UpdateOptions{})
+	s.client.CoreV1().Pods(pod.Namespace).Bind(context.TODO(), &coreV1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
@@ -72,9 +103,10 @@ func (s *Scheduler) Random(pod *coreV1.Pod, nodes *coreV1.NodeList) (string, err
 			Kind:       "Node",
 			Name:       randomNode.GetName(),
 		},
-	})
+	}, metav1.CreateOptions{})
+
 	timestamp := time.Now().UTC()
-	s.client.CoreV1().Events(pod.Namespace).Create(&coreV1.Event{
+	s.client.CoreV1().Events(pod.Namespace).Create(context.TODO(), &coreV1.Event{
 		Count:          1,
 		Message:        "Pod Scheduled",
 		Reason:         "Scheduled",
@@ -93,11 +125,13 @@ func (s *Scheduler) Random(pod *coreV1.Pod, nodes *coreV1.NodeList) (string, err
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: pod.Name + "-",
 		},
-	})
+	}, metav1.CreateOptions{})
+
 	log.Info("Scheduled Pod ", pod.GetName(), " on node ", randomNode.GetName())
 	if err != nil {
 		log.Error("Failed to schedule pod", err.Error())
-		return "", errors.Wrap(err, "Failed to list the nodes")
+		return errors.Wrap(err, "Failed to list the nodes")
 	}
-	return nodes.Items[randomNumber].GetName(), nil
+
+	return nil
 }
