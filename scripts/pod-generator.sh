@@ -1,0 +1,1 @@
+for i in {0..$1}; do sed "s/pod-1/pod-$i/g" manifests/pod.yaml | kubectl apply -f -; done
