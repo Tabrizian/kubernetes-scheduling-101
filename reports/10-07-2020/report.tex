@@ -1,0 +1,193 @@
+\documentclass[11pt]{article}
+
+\usepackage[
+backend=biber,
+style=apa,
+citestyle=numeric-comp
+]{biblatex}
+
+\usepackage[linesnumbered,lined,boxed]{algorithm2e}
+\usepackage{amsmath}
+\usepackage[capitalise]{cleveref}
+
+\newcommand{\floor}[1] {\Bigl\lfloor{#1}\Bigr\rfloor}
+\newcommand{\ceil}[1] {\Bigl\lceil{#1}\Bigr\rceil}
+
+\addbibresource{gpuscheduling.bib}
+
+\author{Iman Tabrizian}
+\title{Scheduling Algorithm}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+With initial results showing the potential performance gain for co-locating ML
+jobs there are a couple of questions that need to be answered:
+
+\begin{enumerate}
+    \item What is the average GPU utilization for jobs in the data centers?
+        \begin{enumerate}
+            \item Using MSR Philly~\cite{philly} trace as a reference for low
+                GPU utilization in data center environments.
+        \end{enumerate}
+    \item What is a good heuristic to schedule the jobs?
+        \begin{enumerate}
+            \item Add a job to the node if the total GPU utilization doesn't
+                exceed a certain bound?
+            \item Add a job to the node if the total GPU memory utilization
+                doesn't exceed a certain bound?
+        \end{enumerate}
+\end{enumerate}
+
+\section{Algorithm}
+
+Depending on what algorithm we use and what criteria we are trying to maximize
+different algorithms can be proposed. The main goal of this body of work is to
+minimize total job completion time (JCT).
+
+\begin{algorithm}[H]
+    \SetAlgoLined
+    \KwData{Pods, nodes, queue}
+    \KwResult{Placement of Pods on the nodes}
+    \While{queue is not empty}{
+        $job \leftarrow findShortest(queue)$\;
+        \tcp{Find the nodes with available capacity}
+        $nodes \leftarrow filter(nodes, job)$\;
+
+        \eIf{$len(nodes) > 0$} {
+            \tcp{Find the node that maximizes throughput for a given job}
+            $node \leftarrow MaximizeThroughput(nodes, job)$\;
+            $queue.remove(job)$\;
+            } {
+            \tcp{Can't find a node with enough capacity}
+            $queue.moveBack(job)$\;
+        }
+    }
+    \caption{Main Scheduling Loop}
+\end{algorithm}
+
+\section{Monitoring and Metrics Collection}
+
+For monitoring and collecting metrics we focus on two most important aspects.
+The first part is collection of systems performance data such as GPU
+utilization, GPU memory bandwidth utilization, CPU usage, and memory usage.
+
+The second part is collection of application level monitoring data. For the
+specific problem that we are currently studying, it is important to collect job
+throughput, job GPU memory usage, job CPU memory usage, and job DRAM usage.
+
+There are some other meta data about each training job that needs to be stored.
+For example, we need to calculate how many iterations it is required until the
+end of the training and how long does each iteration take. This will help us
+identify the job that completes faster and schedule that job first.
+
+\section{Modeling the Performance of Co-located Jobs}
+
+In order to maximize the throughput of co-located jobs we need to have some kind
+of performance models to effectively predict how the performance will be.
+
+Each training job needs to perform many different tasks that some of them are
+running on CPUs (e.g.\ data loading, logging, benchmarking), some tasks that
+are running on GPUs (kernel execution), and some other tasks that involve
+collaboration between GPUs and CPUs (e.g.\ copying data to GPU memory).
+
+\subsection{What Happens When Jobs Run Simultaneously on GPUs?}
+
+Sharing a GPU between different CUDA contexts can have the following effects:
+
+\begin{enumerate}
+    \item Time Multiplexing:
+        When the GPU is time multiplexed
+    \item Space Multiplexing:
+        When the GPU is space multiplexed and they share the GPU space
+\end{enumerate}
+
+\subsection{How to Model the Performance of Co-Location}
+
+Assume that kernel $k^j_i$, takes $t^j_i$ time for execution. If the kernels are
+executed sequentially, the total time would be $T_j=\sum_{i=1}^n t^j_i$. The
+assumption here is that kernels will not run concurrently and they will execute
+in order.
+
+For each $k^j_i$ there are $m^j_i$ thread blocks that need to be scheduled.
+Assume that our GPU model supports $P$ SMs and each SM can handle $c^j_i$ thread
+blocks running concurrently for specific kernel $k^j_i$. By utilizing all the
+SMs on our GPU, we can run $P*c^j_i$ of kernel $k^j_i$. The factors that limit
+the number of thread blocks running concurrently on a GPU are below:
+
+\begin{enumerate}
+    \item Amount of shared memory required by each of the kernels ($s^k_i$)
+    \item Total number of threads that each thread block uses ($h^k_i$)
+    \item Total number of registers required ($r^k_i$)
+\end{enumerate}
+
+If we denote the total number of threads that each SM supports as $H$, total
+number of registers as $R$, total amount of shared memory as $S$, and total
+number thread blocks supported by the SM as $B$. Also, each kernel requires
+$\gamma^j_i=\ceil{\frac{m^j_i}{P.c_j^i}}$  iterations to run completely.  $c_j^i$ can be
+calculated using \cref{eq:tb-limit}. Each group of thread blocks being scheduled
+together takes constant time $\theta^j_i$
+
+\begin{align}
+    c^j_i = \min (\floor{\frac{S}{s^j_i}}, \floor{\frac{H}{h^j_i}},
+    \floor{\frac{R}{r^j_i}}, B)
+    \label{eq:tb-limit}
+\end{align}
+
+Our objective function is depicted in \cref{eq:obj} where $J_j=\sum_{i=1}^n
+t^j_i$.
+
+\begin{align}
+    \min \sum_{j=1}^N J_j
+    \label{eq:obj}
+\end{align}
+
+
+We can (unsafely) assume that $c^j_i \propto \frac{1}{t^j_i}$. This means that
+if more blocks are being scheduled for a given kernel, the kernel will run
+faster. This is not completely true in the practical sense. However, this
+approximation may help us better understand the performance in this specific
+context.
+
+Then the total execution time of job $J_j$ is equal to:
+
+\begin{align}
+    \sum_{i=1}^n \theta^j_i.\gamma^j_i
+    \label{eq:job}
+\end{align}
+
+\cref{eq:job} shows that if we are able to run as many thread blocks as
+possible, we will be able to run the kernel faster since it will decrease
+$\gamma^j_i$ without changing $\theta^j_i$.
+
+\cref{eq:job} should (hopefully!) work when the job is running alone. However,
+things we'll be more complicated when we are going to share the GPU spatially
+with other jobs.
+
+\subsection{Modeling Co-Location of Two Jobs Spatially}
+
+When the jobs are being co-located, $c^j_i$ is no longer constant. The reason is
+that GPU resources such as $S$, $H$, $B$, and $R$ maybe in use by other CUDA
+contexts. In this case, $c^j_i(S, H, R, B)$ is a function of remaining $S$, $H$,
+$B$, and $R$ values. We can add indices to these variables to represent the
+number currently in use by context $j$.
+
+\begin{align}
+    c^j_i(S^j_i, H^j_i, R^j_i, B^j_i)
+\end{align}
+
+
+\section{Benchmarking and Verification of Claims}
+
+Formulation is not very popular in systems community usually due to the
+complicated aspects of systems. In this section, we try to run a couple of
+benchmarks to verify the results of formulation.
+
+\subsection{Claim 1: If the Thread Blocks Are Scheduled Simultaneously the Time
+is Constant}
+
+
+\printbibliography
+\end{document}
